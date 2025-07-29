@@ -85,3 +85,7 @@ site/
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/ 
+
+#user documents
+guide.html
+sql_help_confluence_documentation.md
