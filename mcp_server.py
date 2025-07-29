@@ -385,13 +385,15 @@ class OracleMCPServer:
             if schema:
                 query = "SELECT TABLE_NAME FROM ALL_TABLES WHERE OWNER = :schema"
                 params = [schema]
+                if pattern:
+                    query += " AND TABLE_NAME LIKE :pattern"
+                    params.append(f"%{pattern.upper()}%")
             else:
                 query = "SELECT TABLE_NAME FROM USER_TABLES"
                 params = []
-            
-            if pattern:
-                query += " AND TABLE_NAME LIKE :pattern"
-                params.append(f"%{pattern.upper()}%")
+                if pattern:
+                    query += " WHERE TABLE_NAME LIKE :pattern"
+                    params.append(f"%{pattern.upper()}%")
             
             query += " ORDER BY TABLE_NAME"
             
