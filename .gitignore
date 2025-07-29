@@ -48,13 +48,13 @@ mcp_server.log
 *.sqlite
 
 # Database schema and table files (generated content)
-db_index.json
-tables/
-database_tables/
-column_catalog.csv
-table_catalog.csv
-database_schema.md
-database_schema.json
+schema/db_index.json
+schema/tables/
+schema/database_tables/
+schema/catalogs/column_catalog.csv
+schema/catalogs/table_catalog.csv
+schema/docs/database_schema.md
+schema/docs/database_schema.json
 
 # Oracle client files (if any)
 oracle_client/

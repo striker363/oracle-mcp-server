@@ -532,7 +532,7 @@ class OracleMCPServer:
         
         try:
             # Load existing schema index if available
-            schema_file = "db_index.json"
+            schema_file = "schema/db_index.json"
             if os.path.exists(schema_file):
                 with open(schema_file, 'r') as f:
                     return f.read()
@@ -545,7 +545,7 @@ class OracleMCPServer:
             schema_info = {
                 "tables": tables,
                 "generated_at": datetime.now().isoformat(),
-                "note": "Basic schema info - load db_index.json for detailed information"
+                "note": "Basic schema info - load schema/db_index.json for detailed information"
             }
             
             cursor.close()

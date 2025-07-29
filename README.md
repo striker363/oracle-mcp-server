@@ -78,6 +78,24 @@ A Model Context Protocol (MCP) server that provides direct SQL query execution c
    python mcp_server.py
    ```
 
+## 📁 Project Structure
+
+```
+SQLHelp/
+├── schema/                    # Schema and database structure files
+│   ├── db_index.json         # Main schema index with table relationships
+│   ├── tables/               # Individual table schema files (JSON)
+│   ├── database_tables/      # HTML documentation for tables
+│   ├── catalogs/             # CSV catalog files
+│   └── docs/                 # Schema documentation
+├── mcp_server.py             # Main MCP server implementation
+├── config.json               # Server configuration
+├── config.example.json       # Example configuration
+├── requirements.txt          # Python dependencies
+├── setup.py                 # Setup script
+└── README.md                # This file
+```
+
 ## ⚙️ Configuration
 
 The server uses `config.json` for configuration. Copy `config.example.json` to `config.json` and update with your Oracle database details:
