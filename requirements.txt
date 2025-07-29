@@ -1,0 +1,8 @@
+# MCP Server Dependencies
+mcp>=1.0.0
+
+# Oracle Database Driver
+oracledb>=2.0.0
+
+# Optional: For enhanced logging and formatting
+rich>=13.0.0

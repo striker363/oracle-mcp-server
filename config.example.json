@@ -1,0 +1,21 @@
+{
+    "database": {
+        "host": "your-oracle-host",
+        "port": 1521,
+        "username": "your-username",
+        "password": "your-password",
+        "sid": "your-sid",
+        "service_name": null
+    },
+    "mcp": {
+        "server_name": "oracle-sql-helper",
+        "version": "1.0.0",
+        "description": "Oracle Database MCP Server for SQL query execution",
+        "max_results": 1000,
+        "timeout_seconds": 30
+    },
+    "logging": {
+        "level": "INFO",
+        "file": "mcp_server.log"
+    }
+} 
