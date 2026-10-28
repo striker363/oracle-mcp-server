@@ -7,6 +7,7 @@ A Model Context Protocol server for executing SQL queries against Oracle Databas
 import asyncio
 import json
 import logging
+import re
 import sys
 from typing import Any, Dict, List, Optional, Union
 import traceback
@@ -159,6 +160,66 @@ class OracleMCPServer:
                         },
                         "required": ["query"]
                     }
+                ),
+                Tool(
+                    name="get_package",
+                    description="Get PL/SQL package source code (spec and/or body) from ALL_SOURCE with object status",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Package name"
+                            },
+                            "schema": {
+                                "type": "string",
+                                "description": "Schema/owner name (default: APPS)"
+                            },
+                            "include_body": {
+                                "type": "boolean",
+                                "description": "Include package body (default: true)"
+                            }
+                        },
+                        "required": ["name"]
+                    }
+                ),
+                Tool(
+                    name="update_package",
+                    description="Update PL/SQL package via CREATE OR REPLACE. Pass full DDL text (starting with 'CREATE OR REPLACE PACKAGE [BODY]'). Use dry_run=true to preview without executing. Returns compile status and errors.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Package name (used to check compile status)"
+                            },
+                            "schema": {
+                                "type": "string",
+                                "description": "Schema/owner name (default: APPS)"
+                            },
+                            "spec": {
+                                "type": "string",
+                                "description": "Full package specification DDL (CREATE OR REPLACE PACKAGE ... END;)"
+                            },
+                            "body": {
+                                "type": "string",
+                                "description": "Full package body DDL (CREATE OR REPLACE PACKAGE BODY ... END;)"
+                            },
+                            "spec_file": {
+                                "type": "string",
+                                "description": "Path to a file with the full spec DDL (alternative to 'spec')"
+                            },
+                            "body_file": {
+                                "type": "string",
+                                "description": "Path to a file with the full body DDL (alternative to 'body')"
+                            },
+                            "dry_run": {
+                                "type": "boolean",
+                                "description": "Preview statements without executing (default: false)"
+                            }
+                        },
+                        "required": ["name"]
+                    }
                 )
             ]
         
@@ -176,6 +237,10 @@ class OracleMCPServer:
                     return await self._get_table_relationships(arguments)
                 elif name == "analyze_query_plan":
                     return await self._analyze_query_plan(arguments)
+                elif name == "get_package":
+                    return await self._get_package(arguments)
+                elif name == "update_package":
+                    return await self._update_package(arguments)
                 else:
                     return [TextContent(type="text", text=f"Unknown tool: {name}")]
             except Exception as e:
@@ -228,7 +293,13 @@ class OracleMCPServer:
         
         try:
             db_config = self.config["database"]
-            
+
+            # Optional thick mode (Instant Client) — required for legacy password verifiers
+            if db_config.get("thick_mode") and not getattr(oracledb, "_thick_init_done", False):
+                lib_dir = db_config.get("instant_client_dir")
+                oracledb.init_oracle_client(lib_dir=lib_dir) if lib_dir else oracledb.init_oracle_client()
+                oracledb._thick_init_done = True
+
             # Create connection string
             if db_config.get("service_name"):
                 dsn = f"{db_config['host']}:{db_config['port']}/{db_config['service_name']}"
@@ -292,7 +363,8 @@ class OracleMCPServer:
                             elif isinstance(val, (datetime,)):
                                 formatted_row.append(val.strftime("%Y-%m-%d %H:%M:%S"))
                             else:
-                                formatted_row.append(str(val))
+                                # make embedded newlines visible (e.g. ALL_SOURCE rows stored with trailing \n)
+                                formatted_row.append(str(val).replace("\r\n", "\\n").replace("\n", "\\n"))
                         result += " | ".join(formatted_row) + "\n"
                     
                     result += truncated_msg
@@ -320,6 +392,16 @@ class OracleMCPServer:
         
         try:
             cursor = self.connection.cursor()
+            
+            # Resolve synonyms (EBS: APPS schema has synonyms to real owners like GL, AP, AR)
+            if schema:
+                cursor.execute(
+                    "SELECT TABLE_OWNER, TABLE_NAME FROM ALL_SYNONYMS "
+                    "WHERE SYNONYM_NAME = :s AND OWNER = :o",
+                    [table_name, schema])
+                row = cursor.fetchone()
+                if row:
+                    schema, table_name = row[0], row[1]
             
             # Query for column information
             if schema:
@@ -526,6 +608,211 @@ class OracleMCPServer:
             logger.error(f"Error analyzing query plan: {e}")
             return [TextContent(type="text", text=f"Error analyzing plan: {str(e)}")]
     
+    async def _get_package(self, arguments: Dict[str, Any]) -> List[TextContent]:
+        """Get PL/SQL package source code"""
+        await self._connect_database()
+
+        name = arguments["name"].upper()
+        schema = (arguments.get("schema") or "APPS").upper()
+        include_body = arguments.get("include_body", True)
+
+        try:
+            cursor = self.connection.cursor()
+
+            # Object status and last DDL time
+            cursor.execute("""
+                SELECT OBJECT_TYPE, STATUS, LAST_DDL_TIME
+                FROM ALL_OBJECTS
+                WHERE OWNER = :o AND OBJECT_NAME = :n
+                  AND OBJECT_TYPE IN ('PACKAGE', 'PACKAGE BODY')
+                ORDER BY OBJECT_TYPE
+            """, [schema, name])
+            obj_rows = cursor.fetchall()
+
+            if not obj_rows:
+                return [TextContent(type="text",
+                    text=f"Package {schema}.{name} not found")]
+
+            # Source lines
+            cursor.execute("""
+                SELECT "TYPE" AS SO_TYPE, LINE, TEXT
+                FROM ALL_SOURCE
+                WHERE OWNER = :o AND NAME = :n
+                  AND "TYPE" IN ('PACKAGE', 'PACKAGE BODY')
+                ORDER BY SO_TYPE, LINE
+            """, [schema, name])
+            source_rows = cursor.fetchall()
+
+            lines = []
+            lines.append(f"Package: {schema}.{name}\n")
+            for otype, status, ddl_time in obj_rows:
+                lines.append(f"- {otype}: status={status}, last DDL={ddl_time or 'N/A'}")
+            lines.append("")
+
+            # Note about the ALL_SOURCE trailing-newline storage artifact (created via oracledb DDL)
+            for part in ("PACKAGE", "PACKAGE BODY"):
+                part_rows = [r for r in source_rows if r[0] == part]
+                if not part_rows:
+                    continue
+                with_nl = sum(1 for r in part_rows if (r[2] or "").endswith("\n"))
+                if with_nl:
+                    lines.append(f"- note: {part} rows in ALL_SOURCE stored with trailing '\\n' "
+                                 f"({with_nl}/{len(part_rows)}); stripped below")
+                    lines.append("")
+
+            for part in ("PACKAGE", "PACKAGE BODY"):
+                if part == "PACKAGE BODY" and not include_body:
+                    continue
+                part_lines = [(r[2] or "").rstrip("\n") for r in source_rows if r[0] == part]
+                if part_lines:
+                    lines.append(f"{'-' * 20} {part} ({len(part_lines)} lines) {'-' * 20}")
+                    lines.extend(part_lines)
+                    lines.append("")
+
+            cursor.close()
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        except Exception as e:
+            logger.error(f"Error getting package: {e}")
+            return [TextContent(type="text", text=f"Error getting package: {str(e)}")]
+
+    async def _update_package(self, arguments: Dict[str, Any]) -> List[TextContent]:
+        """Update PL/SQL package via CREATE OR REPLACE"""
+        await self._connect_database()
+
+        name = arguments["name"].upper()
+        schema = (arguments.get("schema") or "APPS").upper()
+        dry_run = arguments.get("dry_run", False)
+
+        spec = (arguments.get("spec") or "").strip()
+        if not spec and arguments.get("spec_file"):
+            with open(arguments["spec_file"], "r") as f:
+                spec = f.read().strip()
+        body = (arguments.get("body") or "").strip()
+        if not body and arguments.get("body_file"):
+            with open(arguments["body_file"], "r") as f:
+                body = f.read().strip()
+
+        if not spec and not body:
+            return [TextContent(type="text",
+                text="Nothing to do: provide 'spec' and/or 'body' with full DDL")]
+
+        statements = []
+        for kind, text in (("spec", spec), ("body", body)):
+            t = text.strip()
+            if not t:
+                continue
+            if not t.lower().startswith("create or replace"):
+                # accept raw package source (starting with 'PACKAGE [BODY] name') and build the DDL header
+                m = re.match(r'^\s*PACKAGE\s+(BODY\s+)?[A-Za-z0-9_$#]+', t, re.I)
+                if not m:
+                    return [TextContent(type="text",
+                        text=f"Error: '{kind}' must be full DDL starting with 'CREATE OR REPLACE PACKAGE [BODY] ...' "
+                             f"or raw source starting with 'PACKAGE [BODY] <name>'.")]
+                part = "BODY " if (m.group(1) and kind == "body") else ""
+                t = (f"CREATE OR REPLACE PACKAGE {part}{schema}.{name}\n"
+                     + re.sub(r'^\s*PACKAGE\s+(BODY\s+)?[A-Za-z0-9_$#]+', '', t, count=1, flags=re.I).lstrip("\n"))
+            statements.append((kind, t))
+
+        if dry_run:
+            preview = [f"DRY RUN for {schema}.{name} — nothing executed.\n"]
+            for kind, t in statements:
+                preview.append(f"--- {kind} ({len(t.splitlines())} lines) ---")
+                preview.append(t)
+            preview.append("")
+            preview.append("Set dry_run=false to execute.")
+            return [TextContent(type="text", text="\n".join(preview))]
+
+        try:
+            ts_before = datetime.now()
+            cursor = self.connection.cursor()
+
+            for kind, t in statements:
+                logger.info(f"Executing package {kind} DDL for {schema}.{name}")
+                cursor.execute(t)
+            self.connection.commit()
+
+            # Compile status / errors after DDL
+            cursor.execute("""
+                SELECT OBJECT_TYPE, STATUS, LAST_DDL_TIME
+                FROM ALL_OBJECTS
+                WHERE OWNER = :o AND OBJECT_NAME = :n
+                  AND OBJECT_TYPE IN ('PACKAGE', 'PACKAGE BODY')
+                ORDER BY OBJECT_TYPE
+            """, [schema, name])
+            obj_rows = cursor.fetchall()
+
+            # Errors exist only if the last compile failed (cleared on success)
+            cursor.execute("""
+                SELECT "TYPE" AS SO_TYPE, SEQUENCE, POSITION, LINE, TEXT
+                FROM ALL_ERRORS
+                WHERE OWNER = :o AND NAME = :n
+                  AND "TYPE" IN ('PACKAGE', 'PACKAGE BODY')
+                ORDER BY SO_TYPE, SEQUENCE
+            """, [schema, name])
+            err_rows = cursor.fetchall()
+
+            result = [f"Package {schema}.{name} updated.\n"]
+            for otype, status, ddl_time in obj_rows:
+                result.append(f"- {otype}: status={status}, last DDL={ddl_time}")
+            if err_rows:
+                result.append("")
+                result.append("Compile errors:")
+                for etype, seq, pos, line, text in err_rows:
+                    result.append(f"  [{etype} line {line}] {text.strip()}")
+            else:
+                result.append("")
+                result.append("No compile errors.")
+
+            # Source verification: sent text vs stored ALL_SOURCE (cosmetic-insensitive)
+            for kind, t in statements:
+                otype = "PACKAGE" if kind == "spec" else "PACKAGE BODY"
+                cursor.execute("""
+                    SELECT "TEXT" FROM ALL_SOURCE
+                    WHERE OWNER = :o AND NAME = :n AND "TYPE" = :t
+                    ORDER BY LINE
+                """, [schema, name, otype])
+                stored = "\n".join((r[0] or "").rstrip("\n") for r in cursor.fetchall())
+                sent_n = self._normalize_source_lines(t)
+                stored_n = self._normalize_source_lines(stored)
+                result.append("")
+                if sent_n == stored_n:
+                    result.append(f"Source check ({kind}): identical ({len(stored_n)} lines)")
+                else:
+                    diffs = [(i + 1, a, b) for i, (a, b) in
+                             enumerate(zip(sent_n, stored_n)) if a != b]
+                    if len(sent_n) != len(stored_n):
+                        diffs.append((min(len(sent_n), len(stored_n)) + 1,
+                                      "<sent: %d lines>" % len(sent_n),
+                                      "<stored: %d lines>" % len(stored_n)))
+                    result.append(f"Source check ({kind}): DIFFERS - {len(diffs)} line(s) differ:")
+                    for ln, a, b in diffs[:10]:
+                        result.append(f"  line {ln}: sent={a!r} stored={b!r}")
+                    if len(diffs) > 10:
+                        result.append(f"  ... and {len(diffs) - 10} more")
+
+            cursor.close()
+            return [TextContent(type="text", text="\n".join(result))]
+
+        except Exception as e:
+            logger.error(f"Error updating package: {e}")
+            return [TextContent(type="text", text=f"Error updating package: {str(e)}")]
+
+    @staticmethod
+    def _normalize_source_lines(text: str) -> List[str]:
+        """Normalize PL/SQL source for comparison: drop CREATE OR REPLACE header
+        and the declaration line, strip trailing newlines, trim blank edges."""
+        import re
+        t = re.sub(r"^\s*CREATE\s+OR\s+REPLACE\s+", "", text, flags=re.I)
+        t = re.sub(r"^\s*PACKAGE\s+(BODY\s+)?[A-Z0-9_$#]+(\.[A-Z0-9_$#]+)?\s*(AUTHID\s+\S+)?\s*(IS|AS)\b",
+                   "", t, count=1, flags=re.I)
+        lines = [l.rstrip() for l in t.splitlines()]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return lines
+
     async def _get_database_schema(self) -> str:
         """Get complete database schema as JSON"""
         await self._connect_database()
